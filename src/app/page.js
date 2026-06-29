@@ -68,9 +68,17 @@ export default function BrainGridGame() {
       if (tilesErr || gameErr || !tilesData) {
         return null;
       }
+
+      // Validate that we have exactly 100 tiles and all values from 1 to 100 are present exactly once
+      const isValid = tilesData.length === 100 && new Set(tilesData.map(t => t.value)).size === 100;
+      if (!isValid) {
+        logWs('SYSTEM', 'db_invalid_data', { count: tilesData.length });
+        return { tiles: tilesData, game: gameData, isInvalid: true };
+      }
+
       setTiles(tilesData);
       setGameState(gameData);
-      return { tiles: tilesData, game: gameData };
+      return { tiles: tilesData, game: gameData, isInvalid: false };
     } catch (e) {
       return null;
     }
@@ -96,6 +104,12 @@ export default function BrainGridGame() {
       // 1. Try to load from Supabase DB
       const dbData = await pullInitialMatchData();
       if (dbData) {
+        if (dbData.isInvalid) {
+          logWs('SYSTEM', 'db_invalid_auto_reset', { info: 'Database had invalid tiles, healing/starting new game' });
+          await handleStartFreshGame();
+          return;
+        }
+
         logWs('SYSTEM', 'db_sync_ok', { tilesCount: dbData.tiles.length });
         
         // If the database game is already finished or stale (target is 1 but has captures), immediately start a fresh game
@@ -320,6 +334,7 @@ export default function BrainGridGame() {
 
   // Start fresh game synchronized via WebSockets
   const handleStartFreshGame = async () => {
+    if (isResetting) return;
     setIsResetting(true);
     try {
       const freshTiles = [];
@@ -362,50 +377,77 @@ export default function BrainGridGame() {
         });
       }
 
-      // Persist to Supabase DB in background (wipe and insert fresh tiles, with direct update fallback)
+      // Persist to Supabase DB (try upsert first to prevent blank board states during transition)
       try {
-        supabase
-          .from('brain_tiles')
-          .delete()
-          .neq('id', 0)
-          .then(() => {
-            const dbTiles = shuffledTiles.map(t => ({
-              value: t.value,
-              expression: t.expression,
-              owner_name: null,
-              owner_color: null
-            }));
+        const dbTiles = shuffledTiles.map(t => ({
+          id: t.id,
+          value: t.value,
+          expression: t.expression,
+          owner_name: null,
+          owner_color: null
+        }));
 
-            supabase
-              .from('brain_tiles')
-              .insert(dbTiles)
-              .then(() => {
-                supabase
-                  .from('brain_game')
-                  .update({ current_target: 1 })
-                  .eq('id', 1)
-                  .then(() => {});
-              })
-              .catch(e => console.warn("Background insert failed", e));
-          })
-          .catch(e => {
-            // Failsafe: if delete fails, clear owners on the existing rows instead of recreating them
-            console.warn("Delete failed, running direct owner clear update instead", e);
-            supabase
+        const { data: upsertedData, error: upsertErr } = await supabase
+          .from('brain_tiles')
+          .upsert(dbTiles)
+          .select();
+
+        if (upsertErr) throw upsertErr;
+
+        if (upsertedData && upsertedData.length === 100) {
+          setTiles(upsertedData);
+        }
+
+        await supabase
+          .from('brain_game')
+          .update({ current_target: 1 })
+          .eq('id', 1);
+
+      } catch (upsertErr) {
+        console.warn("Upsert failed, falling back to delete and insert", upsertErr);
+        // Fallback: Delete and insert (with select to get correct IDs)
+        try {
+          await supabase.from('brain_tiles').delete().neq('id', 0);
+          
+          const insertTiles = shuffledTiles.map(t => ({
+            value: t.value,
+            expression: t.expression,
+            owner_name: null,
+            owner_color: null
+          }));
+
+          const { data: insertedData, error: insertErr } = await supabase
+            .from('brain_tiles')
+            .insert(insertTiles)
+            .select();
+
+          if (insertErr) throw insertErr;
+
+          if (insertedData && insertedData.length === 100) {
+            setTiles(insertedData);
+          }
+
+          await supabase
+            .from('brain_game')
+            .update({ current_target: 1 })
+            .eq('id', 1);
+        } catch (fallbackErr) {
+          console.error("Delete and insert fallback failed", fallbackErr);
+          // Last resort: clear owner columns only
+          try {
+            await supabase
               .from('brain_tiles')
               .update({ owner_name: null, owner_color: null })
-              .neq('id', 0)
-              .then(() => {
-                supabase
-                  .from('brain_game')
-                  .update({ current_target: 1 })
-                  .eq('id', 1)
-                  .then(() => {});
-              })
-              .catch(err => console.warn("Failsafe update failed", err));
-          });
-      } catch (dbErr) {
-        console.warn("Could not reset DB game state in background", dbErr);
+              .neq('id', 0);
+
+            await supabase
+              .from('brain_game')
+              .update({ current_target: 1 })
+              .eq('id', 1);
+          } catch (e) {
+            console.error("Owner clear fallback failed", e);
+          }
+        }
       }
     } catch (e) {
       console.error(e);
